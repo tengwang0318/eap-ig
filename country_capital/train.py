@@ -1,20 +1,54 @@
+import json
+import os
+
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
-from transformers import TrainerCallback
+from transformers import TrainerCallback, DataCollatorForLanguageModeling
 import argparse
 import deepspeed
 import torch
 import numpy as np
 
+LENGTHS = []
 
-# Load Data
+
+#
 def load_data(tokenizer, train_filepath='country_capital_train.jsonl', test_filepath='country_capital_test.jsonl'):
     dataset = load_dataset("json", data_files={"train": train_filepath, "test": test_filepath})
 
     def tokenize_function(examples):
-        return tokenizer(examples['input'], truncation=True, padding=True, max_length=24)
+        # Ġ中间加了个
+        tokenizer_origin_input = tokenizer(
+            examples['clean']
+        )
 
-    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+        lengths = [len(item) for item in tokenizer_origin_input['input_ids']]
+
+        combined_texts = [f"{clean} {label}" for clean, label in zip(examples['clean'], examples['label'])]
+        tokenized_inputs = tokenizer(
+            combined_texts,
+            truncation=True,
+            padding=True,
+            max_length=28
+        )
+        labels = [input_ids[length] for length, input_ids in zip(lengths, tokenized_inputs['input_ids'])]
+
+        tokenized_inputs['label'] = torch.tensor(labels, dtype=torch.long)
+        # print(combined_texts[0])
+        # print(tokenized_inputs["input_ids"][0])
+        # print(tokenized_inputs["label"][0])
+        # os.abort()
+        return {
+            "input_ids": tokenized_inputs["input_ids"],
+            "attention_mask": tokenized_inputs["attention_mask"],
+            "labels": tokenized_inputs["label"],
+        }
+
+    tokenized_datasets = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["clean", "corrupt", "label", "corrupt_label"]
+    )
     return tokenized_datasets
 
 
@@ -44,15 +78,41 @@ class CacheCallback(TrainerCallback):
             model.config.use_cache = False  # Disable cache at the end of training
 
 
-# Custom Evaluation Function
 def compute_metrics(eval_preds):
     logits, labels = eval_preds
-    # Convert logits to predictions
-    generated_tokens = np.argmax(logits[:, 0, :], axis=-1)  # Only consider the first token
-    # Compare with the first token of the labels
-    correct = (generated_tokens == labels[:, 0]).astype(int)
+
+    predicted_tokens = np.argmax(logits, axis=-1)  # (batch_size, sequence_length)
+
+    global LENGTHS
+    batch_size = logits.shape[0]
+
+    if len(LENGTHS) != batch_size:
+        raise ValueError(f"Expected LENGTHS to have size {batch_size}, but got {len(LENGTHS)}.")
+
+    generated_tokens = np.array([predicted_tokens[i, LENGTHS[i]] for i in range(batch_size)])
+    ground_truth = np.array([labels[i, LENGTHS[i]] for i in range(batch_size)])
+    print(predicted_tokens.shape)
+    print(labels.shape)
+    print(generated_tokens.shape)
+
+    correct = (generated_tokens == ground_truth).astype(int)
     accuracy = np.mean(correct)
+
+    print("Generated Tokens:", generated_tokens)
+    print("ground truth:", ground_truth)
+    print("Correct Predictions:", correct)
+    print("Accuracy:", accuracy)
+
     return {"accuracy": accuracy}
+
+
+def load_all_test_data(test_path, tokenizer):
+    with open(test_path) as f:
+        for line in f.readlines():
+            dic = json.loads(line)
+            input_ids = tokenizer(dic['clean'])['input_ids']
+            LENGTHS.append(len(input_ids))
+    print(f"Length: {len(LENGTHS)}")
 
 
 # Main Function
@@ -69,24 +129,29 @@ if __name__ == '__main__':
 
     # Load and Tokenize Datasets
     datasets = load_data(tokenizer, train_filepath=args.train_filepath, test_filepath=args.test_filepath)
+    load_all_test_data(args.test_filepath, tokenizer)
+    for batch in datasets['train']:
+        print(batch)
+        break
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Define Training Arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        evaluation_strategy="epoch",
+        evaluation_strategy="steps",
+        eval_steps=1,
         save_strategy="epoch",
         save_total_limit=3,
         learning_rate=5e-5,
         gradient_accumulation_steps=4,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
         num_train_epochs=3,
         logging_dir="./logs",
         logging_steps=10,
         report_to="tensorboard",
         deepspeed="ds_config.json",
         fp16=True,
-        predict_with_generate=True  # Use generation during evaluation
     )
 
     # Initialize Trainer
@@ -94,10 +159,11 @@ if __name__ == '__main__':
         model=model,
         tokenizer=tokenizer,
         args=training_args,
+        data_collator=data_collator,
         train_dataset=datasets['train'],
         eval_dataset=datasets['test'],
         compute_metrics=compute_metrics,
-        callbacks=[CacheCallback()],  # Pass the custom CacheCallback here
+        callbacks=[CacheCallback()],
     )
 
     # Train the Model
