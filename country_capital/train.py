@@ -119,7 +119,7 @@ def load_all_test_data(test_path, tokenizer):
 if __name__ == '__main__':
     # Parse Command-Line Arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="/home/data/pythia-1.4b-deduped/")
+    parser.add_argument("--model_name", type=str, default="EleutherAI/pythia-1.4b-deduped")
     parser.add_argument('--train_filepath', type=str, default='data_correct_logic/country_capital_train.jsonl')
     parser.add_argument('--test_filepath', type=str, default='data_correct_logic/country_capital_test.jsonl')
     args = parser.parse_args()
@@ -144,8 +144,8 @@ if __name__ == '__main__':
         save_total_limit=3,
         learning_rate=5e-5,
         gradient_accumulation_steps=4,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=4,
         num_train_epochs=3,
         logging_dir="./logs",
         logging_steps=10,
